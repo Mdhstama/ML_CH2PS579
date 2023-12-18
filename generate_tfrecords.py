@@ -1,88 +1,101 @@
+#based on https://github.com/datitran/raccoon_dataset/blob/master/generate_tfrecord.py
+
+from __future__ import division
+from __future__ import print_function
+from __future__ import absolute_import
+
 import os
 import io
-from lxml import etree
+import pandas as pd
+
+from tensorflow.python.framework.versions import VERSION
+if VERSION >= "2.0.0a0":
+    import tensorflow.compat.v1 as tf
+else:
+    import tensorflow as tf
+
 from PIL import Image
-import tensorflow.compat.v1 as tf
-from models.research.object_detection.utils import dataset_util
-from models.research.object_detection.utils import label_map_util
+from object_detection.utils import dataset_util
+from collections import namedtuple, OrderedDict
 
-# Rest of your script remains unchanged
-def create_tf_example(image_path, annotation_path, label_map_dict):
-    with tf.compat.v1.gfile.GFile(annotation_path, 'r') as fid:
-        xml_str = fid.read()
+flags = tf.app.flags
+flags.DEFINE_string('csv_input', '', 'Path to the CSV input')
+flags.DEFINE_string('output_path', '', 'Path to output TFRecord')
+flags.DEFINE_string('image_dir', '', 'Path to images')
+FLAGS = flags.FLAGS
 
-    # Parse XML annotation
-    xml = etree.fromstring(xml_str)
+''' 
+*************************************************************************
+Make sure to edit this method to match the labels you made with labelImg!
+*************************************************************************
+'''
+def class_text_to_int(row_label):
+    if row_label == 'total':
+        return 1
+    else:
+        return None
 
-    # Read the image
-    with tf.compat.v1.gfile.GFile(image_path, 'rb') as fid:
-        encoded_image_data = fid.read()
+def split(df, group):
+    data = namedtuple('data', ['filename', 'object'])
+    gb = df.groupby(group)
+    return [data(filename, gb.get_group(x)) for filename, x in zip(gb.groups.keys(), gb.groups)]
 
-    # Parse bounding box coordinates
-    xmin = int(xml.find('.//xmin').text)
-    ymin = int(xml.find('.//ymin').text)
-    xmax = int(xml.find('.//xmax').text)
-    ymax = int(xml.find('.//ymax').text)
-
-    # Get image size
-    image = Image.open(image_path)
+def create_tf_example(group, path):
+    with tf.gfile.GFile(os.path.join(path, '{}'.format(group.filename)), 'rb') as fid:
+        encoded_jpg = fid.read()
+    encoded_jpg_io = io.BytesIO(encoded_jpg)
+    image = Image.open(encoded_jpg_io)
     width, height = image.size
 
-    # Get label id using label_map_dict
-    label = xml.find('.//name').text
-    label_id = label_map_dict[label]
+    filename = group.filename.encode('utf8')
+    image_format = b'jpg'
+    xmins = []
+    xmaxs = []
+    ymins = []
+    ymaxs = []
+    classes_text = []
+    classes = []
 
-    # Create TF example
-    tf_example = tf.compat.v1.train.Example(features=tf.train.Features(feature={
-        'image/encoded': dataset_util.bytes_feature(encoded_image_data),
-        'image/format': dataset_util.bytes_feature('jpeg'.encode('utf8')),
-        'image/object/bbox/xmin': dataset_util.float_list_feature([xmin / width]),
-        'image/object/bbox/xmax': dataset_util.float_list_feature([xmax / width]),
-        'image/object/bbox/ymin': dataset_util.float_list_feature([ymin / height]),
-        'image/object/bbox/ymax': dataset_util.float_list_feature([ymax / height]),
-        'image/object/class/text': dataset_util.bytes_feature(label.encode('utf8')),
-        'image/object/class/label': dataset_util.int64_list_feature([label_id]),
+    for index, row in group.object.iterrows():
+        xmins.append(row['xmin'] / width)
+        xmaxs.append(row['xmax'] / width)
+        ymins.append(row['ymin'] / height)
+        ymaxs.append(row['ymax'] / height)
+        classes_text.append(row['class'].encode('utf8'))
+        classes.append(class_text_to_int(row['class']))
+
+    tf_example = tf.train.Example(features=tf.train.Features(feature={
+        'image/height': dataset_util.int64_feature(height),
+        'image/width': dataset_util.int64_feature(width),
+        'image/filename': dataset_util.bytes_feature(filename),
+        'image/source_id': dataset_util.bytes_feature(filename),
+        'image/encoded': dataset_util.bytes_feature(encoded_jpg),
+        'image/format': dataset_util.bytes_feature(image_format),
+        'image/object/bbox/xmin': dataset_util.float_list_feature(xmins),
+        'image/object/bbox/xmax': dataset_util.float_list_feature(xmaxs),
+        'image/object/bbox/ymin': dataset_util.float_list_feature(ymins),
+        'image/object/bbox/ymax': dataset_util.float_list_feature(ymaxs),
+        'image/object/class/text': dataset_util.bytes_list_feature(classes_text),
+        'image/object/class/label': dataset_util.int64_list_feature(classes),
     }))
-
     return tf_example
 
-def open_sharded_output_tfrecords(exit_stack, base_path, num_shards):
-    tf_record_output_filenames = [
-        '{}-{:05d}-of-{:05d}'.format(base_path, idx, num_shards)
-        for idx in range(num_shards)
-    ]
+def main(_):
+    writer = tf.python_io.TFRecordWriter(FLAGS.output_path)
+    path = os.path.join(FLAGS.image_dir)
+    examples = pd.read_csv(FLAGS.csv_input)
+    grouped = split(examples, 'filename')
+    for group in grouped:
+        tf_example = create_tf_example(group, path)
+        writer.write(tf_example.SerializeToString())
 
-    tfrecords = [
-        exit_stack.enter_context(tf.compat.v1.python_io.TFRecordWriter(file_name))
-        for file_name in tf_record_output_filenames
-    ]
-
-    return tfrecords
-
-def main(data_dir, output_dir, label_map_path, contextlib2=None):
-    label_map_dict = label_map_util.get_label_map_dict(label_map_path)
-
-    annotation_dir = os.path.join(data_dir, 'annotations')
-    image_dir = os.path.join(data_dir, 'images')
-
-    annotation_files = os.listdir(annotation_dir)
-
-    num_shards = 10
-    with contextlib2.ExitStack() as tf_record_close_stack:
-        output_tfrecords = open_sharded_output_tfrecords(
-            tf_record_close_stack, os.path.join(output_dir, 'output'), num_shards)
-
-        for idx, annotation_file in enumerate(annotation_files):
-            annotation_path = os.path.join(annotation_dir, annotation_file)
-            image_filename = os.path.splitext(annotation_file)[0] + '.jpg'
-            image_path = os.path.join(image_dir, image_filename)
-
-            tf_example = create_tf_example(image_path, annotation_path, label_map_dict)
-            output_tfrecords[idx % num_shards].write(tf_example.SerializeToString())
+    writer.close()
+    output_path = os.path.join(os.getcwd(), FLAGS.output_path)
+    print('Successfully created the TFRecords: {}'.format(output_path))
 
 if __name__ == '__main__':
-    main(
-        data_dir='C:/Users/HP/Documents/Capstone/dataset',
-        output_dir='C:/Users/HP/Documents/Capstone/output',
-        label_map_path='C:/Users/HP/Documents/Capstone/dataset/label_map.pbtxt'
-    )
+    tf.app.run()
+
+# commands:
+# python generate_tfrecord.py --csv_input=images/test_labels.csv --image_dir=images/test --output_path=test.record
+# python generate_tfrecord.py --csv_input=images/train_labels.csv --image_dir=images/train --output_path=train.record
